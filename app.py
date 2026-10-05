@@ -38,6 +38,43 @@ TOPICS = {
     "vlan": "Virtual LANs",
     "cybersecurity": "Cybersecurity Fundamentals",
 }
+EXAMPLE_QUESTIONS_BY_SOURCE = {
+    "cybersecurity.txt": (
+        "Cybersecurity มีเป้าหมายหลัก 3 ด้านอะไรบ้าง?",
+        "VPN ช่วยปกป้องข้อมูลอย่างไรและมีข้อจำกัดอะไร?",
+        "Phishing กับ ransomware แตกต่างกันอย่างไร?",
+    ),
+    "ip_address.txt": (
+        "192.168.1.10/24 หมายถึงอะไร?",
+        "DHCP กับ DNS ทำหน้าที่ต่างกันอย่างไร?",
+        "Default gateway ใช้เมื่อใด?",
+    ),
+    "network_basics.txt": (
+        "Computer network คืออะไร?",
+        "Bandwidth, throughput และ latency ต่างกันอย่างไร?",
+        "Router กับ switch ทำหน้าที่ต่างกันอย่างไร?",
+    ),
+    "osi_model.txt": (
+        "OSI Model มี 7 layers อะไรบ้าง?",
+        "Encapsulation ใน OSI Model ทำงานอย่างไร?",
+        "ช่วยสร้างคำถามทบทวน OSI Model 3 ข้อ",
+    ),
+    "routing.txt": (
+        "Longest-prefix match ใช้เลือก route อย่างไร?",
+        "Static route ต่างจาก dynamic route อย่างไร?",
+        "Default route ใช้เมื่อใด?",
+    ),
+    "tcp_ip.txt": (
+        "TCP และ UDP แตกต่างกันอย่างไร?",
+        "TCP three-way handshake มีขั้นตอนใดบ้าง?",
+        "อธิบาย encapsulation ใน TCP/IP model",
+    ),
+    "vlan.txt": (
+        "VLAN คืออะไรและช่วยแบ่ง broadcast domain อย่างไร?",
+        "Access port กับ trunk port ต่างกันอย่างไร?",
+        "VLAN กับ subnet แตกต่างกันอย่างไร?",
+    ),
+}
 
 st.set_page_config(
     page_title="Personal Tutor | AI Learning Assistant",
@@ -157,13 +194,42 @@ def select_chat_manifest(
     return tuple(entry for entry in manifest if entry[0] in selected)
 
 
-def make_example_questions() -> list[str]:
-    """Create three concise starter prompts for a new or empty chat."""
-    return [
-        "อธิบายหัวข้อนี้",
-        "สรุปก่อนสอบ",
-        "ทบทวนด้วย 3 ข้อ",
+def make_example_questions(selected_sources: tuple[str, ...]) -> list[str]:
+    """Create three starter prompts that directly match selected source content."""
+    def questions_for_source(filename: str) -> tuple[str, ...]:
+        questions = EXAMPLE_QUESTIONS_BY_SOURCE.get(filename)
+        if questions:
+            return questions
+        topic = TOPICS.get(Path(filename).stem, Path(filename).stem.replace("_", " ").title())
+        return (
+            f"{topic} คืออะไร?",
+            f"ช่วยสรุป {topic} สำหรับเตรียมสอบ",
+            f"ช่วยสร้างคำถามทบทวน 3 ข้อเกี่ยวกับ {topic}",
+        )
+
+    examples: list[str] = []
+    for filename in selected_sources:
+        examples.append(questions_for_source(filename)[0])
+        if len(examples) == 3:
+            break
+
+    if len(examples) >= 3:
+        return examples[:3]
+
+    for filename in selected_sources:
+        questions = questions_for_source(filename)
+        for question in questions[1:]:
+            if question not in examples:
+                examples.append(question)
+            if len(examples) == 3:
+                return examples
+
+    fallback = [
+        "ช่วยสรุปเอกสารที่เลือกสำหรับเตรียมสอบ",
+        "ช่วยอธิบายแนวคิดสำคัญจากเอกสารที่เลือก",
+        "ช่วยสร้างคำถามทบทวนจากเอกสารที่เลือก",
     ]
+    return (examples + fallback)[:3]
 
 
 def initialize_chat_state(document_names: list[str]) -> dict[str, dict[str, Any]]:
@@ -176,7 +242,7 @@ def initialize_chat_state(document_names: list[str]) -> dict[str, dict[str, Any]
         chats[chat_id] = {
             "title": title,
             "documents": list(selected_sources),
-            "examples": make_example_questions(),
+            "examples": make_example_questions(selected_sources),
             "messages": st.session_state.pop("messages", []),
         }
         st.session_state["active_chat_id"] = chat_id
@@ -600,7 +666,7 @@ def main() -> None:
                         chats[chat_id] = {
                             "title": title,
                             "documents": list(selected_sources),
-                            "examples": make_example_questions(),
+                            "examples": make_example_questions(selected_sources),
                             "messages": [],
                         }
                         st.session_state["active_chat_id"] = chat_id
@@ -672,7 +738,7 @@ def main() -> None:
         if not messages:
             st.markdown("#### Start with an example")
             st.caption("Choose a prompt below, or write your own question.")
-            examples = make_example_questions()
+            examples = make_example_questions(tuple(active_chat["documents"]))
             example_columns = st.columns(3)
             for index, (column, example) in enumerate(zip(example_columns, examples)):
                 with column:
