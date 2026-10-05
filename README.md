@@ -9,6 +9,7 @@
 - Split notes into 700-character chunks with 80-character overlap. Paragraph and sentence separators preserve readable units; overlap carries a small amount of context across boundaries without making chunks excessively repetitive.
 - Embed chunks and questions with `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`, a compact multilingual sentence model suitable for English and Thai text and a CPU-based Streamlit deployment.
 - Search the FAISS index for 3–5 chunks (default 5). Five chunks provide useful context for multi-part questions while keeping the prompt bounded.
+- Upload additional UTF-8 `.txt` notes from the sidebar; files are saved under `data/documents/` and included in the refreshed FAISS index.
 - Display retrieved filenames, topic, chunk ID, and FAISS L2 distance. A lower distance means a closer vector match; the value is a distance, not a probability.
 - Ask Groq to act as a patient tutor, answer in the question's language, cite source filenames, and refuse when context does not support an answer.
 - Keep chat history in `st.session_state` and provide a Clear Chat control.
@@ -144,6 +145,16 @@ The system prompt directs the model to use only retrieved context, respond in th
 
 5. Open the repository on GitHub and verify the seven documents, app, requirements, README, and evaluation CSV are present. Check that no key or actual `secrets.toml` was pushed.
 
+## Upload Documents in the Web App
+
+1. Open **Add learning documents (.txt)** in the sidebar.
+2. Select one or more UTF-8 `.txt` files and click **Add documents**. The app validates the extension and text encoding, stores files in `data/documents/`, and reports added, duplicate, or invalid files.
+3. After a successful upload, the app reruns. The FAISS cache key hashes the filenames and contents, so the changed corpus is reloaded, re-chunked, embedded, and indexed for subsequent questions.
+
+Existing files are never overwritten. A different document with the same filename gets a numeric suffix; an identical same-name file is skipped. Uploaded file content is treated as reference text, not instructions. Upload only material you have permission to use and do not upload secrets or personal data.
+
+On Streamlit Community Cloud, uploaded files live on the app's local filesystem, which is ephemeral and may be cleared when the app restarts or redeploys. For durable shared documents, add reviewed files to `data/documents/` in the repository and redeploy, or connect persistent external storage.
+
 ## Streamlit Community Cloud Deployment
 
 1. Sign in to Streamlit Community Cloud with the GitHub account that can access the repository.
@@ -160,11 +171,11 @@ The system prompt directs the model to use only retrieved context, respond in th
 5. Test `OSI Model คืออะไร?`, `TCP และ UDP แตกต่างกันอย่างไร?`, `ช่วยสรุปเรื่อง VLAN สำหรับเตรียมสอบ`, `Explain the TCP/IP model.`, and `นายกรัฐมนตรีของประเทศไทยคือใคร?` Confirm citations and inspect **View Retrieved Context**. The last question should be refused.
 6. If dependency installation or startup fails, inspect **Manage app > Logs**. Check Python/dependency compatibility, repository paths, and the Cloud Secrets spelling.
 
-The source documents are committed with the app. Chat history and FAISS vectors are held in memory for the running app. This demonstration does not persist user uploads or chats to an external database.
+The source documents are committed with the app. Chat history and FAISS vectors are held in memory for the running app. Uploaded notes are written to local app storage and are not backed by a persistent external database.
 
 ## Limitations
 
-- Only the committed UTF-8 `.txt` corpus is loaded; PDF and user uploads are not supported in this version.
+- Only UTF-8 `.txt` files are supported; PDFs and other formats are not loaded.
 - Retrieval quality depends on document coverage and semantic similarity. A language model can still make mistakes, so verify important answers against the displayed source excerpts.
 - FAISS L2 distance is useful for ranking but is not a calibrated confidence score. The prompt-based refusal is not a formal guarantee; evaluate the three unknown questions before relying on the app.
 - The first model download and index build use CPU and may be slow or memory-intensive on a small instance.

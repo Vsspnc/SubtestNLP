@@ -20,7 +20,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data" / "documents"
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-CHAT_MODEL = "llama-3.3-70b-versatile"
+CHAT_MODEL = "openai/gpt-oss-120b"
 TOP_K = 5
 CHUNK_SIZE = 700
 CHUNK_OVERLAP = 80
@@ -51,6 +51,30 @@ def get_document_manifest() -> tuple[tuple[str, str], ...]:
         for path in sorted(DATA_DIR.glob("*.txt"))
         if path.is_file()
     )
+
+
+def save_uploaded_document(filename: str, content: bytes) -> tuple[str, bool]:
+    """Save a UTF-8 text upload without overwriting an existing document."""
+    safe_name = Path(filename.replace("\\", "/")).name
+    if not safe_name or Path(safe_name).suffix.lower() != ".txt":
+        raise ValueError("Only .txt documents are supported.")
+
+    text = clean_text(content.decode("utf-8-sig"))
+    if not text:
+        raise ValueError("The file is empty.")
+
+    original = Path(f"{Path(safe_name).stem}.txt")
+    destination = DATA_DIR / original.name
+    suffix = 1
+    normalized_text = text + "\n"
+    while destination.exists():
+        if destination.read_text(encoding="utf-8") == normalized_text:
+            return destination.name, False
+        destination = DATA_DIR / f"{original.stem}_{suffix}{original.suffix}"
+        suffix += 1
+
+    destination.write_text(normalized_text, encoding="utf-8")
+    return destination.name, True
 
 
 def clean_text(text: str) -> str:
@@ -224,6 +248,48 @@ def render_assistant_message(message: dict[str, Any]) -> None:
                 st.divider()
 
 
+def render_document_uploader() -> None:
+    """Accept TXT course notes and refresh the FAISS index after successful saves."""
+    with st.sidebar.form("document_upload_form", clear_on_submit=True):
+        uploaded_files = st.file_uploader(
+            "Add learning documents (.txt)",
+            type=["txt"],
+            accept_multiple_files=True,
+            help="UTF-8 text files are saved to data/documents/ and added to retrieval.",
+        )
+        submitted = st.form_submit_button("Add documents", use_container_width=True)
+
+    if submitted:
+        if not uploaded_files:
+            st.sidebar.error("Select at least one .txt file.")
+            return
+
+        added: list[str] = []
+        skipped: list[str] = []
+        errors: list[str] = []
+        for uploaded_file in uploaded_files:
+            try:
+                filename, created = save_uploaded_document(
+                    uploaded_file.name,
+                    uploaded_file.getvalue(),
+                )
+                (added if created else skipped).append(filename)
+            except (UnicodeDecodeError, OSError, ValueError) as error:
+                errors.append(f"{uploaded_file.name}: {error}")
+
+        if added:
+            st.session_state["upload_feedback"] = {
+                "added": added,
+                "skipped": skipped,
+                "errors": errors,
+            }
+            st.rerun()
+        if skipped:
+            st.sidebar.info("Already present: " + ", ".join(skipped))
+        for error in errors:
+            st.sidebar.error(error)
+
+
 def main() -> None:
     st.title("🎓 Personal Tutor – AI Learning Assistant")
     st.caption("ผู้ช่วยติวส่วนตัวที่ตอบคำถามจากเอกสารการเรียนของคุณ")
@@ -240,6 +306,15 @@ def main() -> None:
         st.caption(f"Embedding: `{EMBEDDING_MODEL}`")
         st.caption(f"LLM: `{CHAT_MODEL}`")
         top_k = st.slider("Top-K retrieval", min_value=3, max_value=5, value=TOP_K)
+        render_document_uploader()
+        upload_feedback = st.session_state.pop("upload_feedback", None)
+        if upload_feedback:
+            if upload_feedback["added"]:
+                st.success("Added: " + ", ".join(upload_feedback["added"]))
+            if upload_feedback["skipped"]:
+                st.info("Already present: " + ", ".join(upload_feedback["skipped"]))
+            for error in upload_feedback["errors"]:
+                st.error(error)
         if st.button("Clear Chat", use_container_width=True):
             st.session_state["messages"] = []
             st.rerun()
