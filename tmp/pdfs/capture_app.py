@@ -1,0 +1,45 @@
+﻿from playwright.sync_api import sync_playwright
+from pathlib import Path
+import json
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+
+out = Path('tmp/pdfs/screenshots'); out.mkdir(parents=True, exist_ok=True)
+with sync_playwright() as p:
+    browser = p.chromium.launch(channel='msedge', headless=True)
+    page = browser.new_page(viewport={'width':1440,'height':1050}, device_scale_factor=1.5)
+    page.goto('http://localhost:8501')
+    page.get_by_role('tab',name='💬 Tutor').wait_for(timeout=240000)
+    page.wait_for_timeout(800); page.screenshot(path=str(out/'01_home.png'))
+    print(page.locator('body').inner_text(),flush=True)
+    page.get_by_text('＋ New chat',exact=True).click()
+    page.wait_for_timeout(800); page.screenshot(path=str(out/'02_new_chat.png'))
+    page.get_by_text('＋ New chat',exact=True).click()
+    page.get_by_role('tab',name='📚 Library').click()
+    page.wait_for_timeout(800); page.screenshot(path=str(out/'03_library.png'))
+    page.get_by_text('Add or update documents',exact=True).click()
+    page.wait_for_timeout(800); page.screenshot(path=str(out/'04_upload.png'))
+    page.get_by_role('tab',name='Write new notes').click()
+    page.get_by_role('textbox',name='Document title',exact=True).fill('DNS Basics')
+    page.get_by_role('textbox',name='Document content',exact=True).fill('DNS ทำหน้าที่แปลงชื่อโดเมนเป็นหมายเลข IP เพื่อช่วยให้ผู้ใช้เข้าถึงบริการเครือข่ายได้สะดวก')
+    page.wait_for_timeout(800); page.screenshot(path=str(out/'05_write.png'))
+    page.get_by_role('tab',name='Append notes').click()
+    page.get_by_role('textbox',name='Content to append',exact=True).fill('บันทึกเพิ่มเติม: ควรตรวจสอบแหล่งอ้างอิงและทบทวนเนื้อหาหลังเรียน')
+    page.wait_for_timeout(800); page.screenshot(path=str(out/'06_append.png'))
+    page.get_by_text('Add or update documents',exact=True).click()
+    page.get_by_role('tab',name='💬 Tutor').click()
+    page.get_by_text('View chat sources',exact=True).click()
+    page.get_by_text('System details',exact=True).click()
+    page.wait_for_timeout(800); page.screenshot(path=str(out/'07_sources.png'))
+    page.get_by_text('View chat sources',exact=True).click()
+    page.get_by_text('System details',exact=True).click()
+    page.get_by_role('textbox',name='Ask only about the documents selected for this chat').fill('OSI Model มี 7 layers อะไรบ้าง?')
+    page.get_by_role('textbox',name='Ask only about the documents selected for this chat').press('Enter')
+    page.wait_for_timeout(12000)
+    print('AFTER QUESTION\n'+page.locator('body').inner_text(),flush=True)
+    page.wait_for_timeout(800); page.screenshot(path=str(out/'08_answer.png'))
+    if page.get_by_text('View Retrieved Context',exact=True).count():
+        page.get_by_text('View Retrieved Context',exact=True).click()
+        page.wait_for_timeout(800); page.screenshot(path=str(out/'09_context.png'))
+    browser.close()
+
