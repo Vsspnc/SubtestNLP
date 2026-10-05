@@ -5,25 +5,28 @@
 ## Objectives and Features
 
 - Ask questions, request explanations and summaries, compare concepts, define terms, and generate review questions from course notes.
-- Load UTF-8 text documents with `DirectoryLoader`, clean whitespace, and retain `filename`, `source`, `document`, `topic`, `start_index`, and `chunk_id` metadata.
+- Load UTF-8 `.txt` notes and text-based PDFs, clean whitespace, and retain `filename`, `source`, `document`, `topic`, `start_index`, `chunk_id`, and PDF page metadata.
 - Split notes into 700-character chunks with 80-character overlap. Paragraph and sentence separators preserve readable units; overlap carries a small amount of context across boundaries without making chunks excessively repetitive.
 - Embed chunks and questions with `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`, a compact multilingual sentence model suitable for English and Thai text and a CPU-based Streamlit deployment.
 - Search the FAISS index for 3–5 chunks (default 5). Five chunks provide useful context for multi-part questions while keeping the prompt bounded.
-- Upload additional UTF-8 `.txt` notes from the sidebar; files are saved under `data/documents/` and included in the refreshed FAISS index.
-- Display retrieved filenames, topic, chunk ID, and FAISS L2 distance. A lower distance means a closer vector match; the value is a distance, not a probability.
+- Upload additional UTF-8 `.txt` notes or selectable-text `.pdf` documents from the Library tab; files are saved under `data/documents/` and included in the refreshed FAISS index.
+- Browse the document inventory, inspect and download existing files, create a text document, or append notes to a selected document in the Documents tab.
+- Display retrieved filenames, PDF page number when available, topic, chunk ID, and FAISS L2 distance. A lower distance means a closer vector match; the value is a distance, not a probability.
 - Ask Groq to act as a patient tutor, answer in the question's language, cite source filenames, and refuse when context does not support an answer.
-- Keep chat history in `st.session_state` and provide a Clear Chat control.
+- Create multiple chats, select the allowed documents for each chat, keep separate history in `st.session_state`, and clear one chat at a time.
+- Show three clickable, topic-specific example questions in every chat; each one submits the question directly.
+- Use a responsive light study-workspace theme with chat controls separated from document management.
 
 ## RAG Architecture
 
 ```mermaid
 flowchart LR
-  A[Learning TXT files] --> B[Load and clean]
+   A[Learning TXT and PDF files] --> B[Load and clean]
   B --> C[700-character chunks, 80 overlap]
   C --> D[Multilingual MiniLM embeddings]
-  D --> E[FAISS index]
+   D --> E[Per-chat FAISS index]
   F[Student question] --> G[Question embedding and Top-K search]
-  E --> G
+   E --> G
   G --> H[Chunks with source metadata and distance]
   H --> I[Grounded tutor prompt]
   I --> J[Groq LLM]
@@ -43,6 +46,7 @@ The seven short course-note documents cover fundamentals, the OSI model, TCP/IP,
 ├── test_questions.csv
 ├── .gitignore
 ├── .streamlit/
+│   ├── config.toml
 │   └── secrets.toml.example
 └── data/
     └── documents/
@@ -75,7 +79,7 @@ python validate_project.py
 streamlit run app.py
 ```
 
-On first launch, the embedding model is downloaded from Hugging Face and the in-memory FAISS index is built. This needs network access and can take a few minutes. The index cache key includes file content hashes, so changing a source document causes a rebuild.
+On first launch, the embedding model is downloaded from Hugging Face and the in-memory FAISS index is built. This needs network access and can take a few minutes. The index cache key includes file content hashes, so changing or adding a source document causes a rebuild. PDF loading uses `pypdf` through LangChain's `PyPDFLoader`.
 
 ## Configuration and Secrets
 
@@ -95,6 +99,12 @@ The real `secrets.toml` is ignored by Git. Never put a real key in source code, 
 - `Explain the TCP/IP model.`
 - `นายกรัฐมนตรีของประเทศไทยคือใคร?` (ควรปฏิเสธ เพราะไม่มีใน corpus)
 - `ช่วยสร้างคำถามทบทวนเรื่อง subnetting`
+
+Each newly created chat also shows three clickable prompts generated from the selected document topics: explain a key concept, summarize it for exam review, and generate three review questions.
+
+## Chats and Document Selection
+
+Use **New chat name** and **Documents for this chat** in the sidebar, then select **Create chat**. Each chat stores its own chosen filenames and message history. The retriever builds an index only from those selected files; a chat cannot retrieve chunks from documents that were not selected for it. Switch chats with **Select chat**, or use **Clear this chat** to clear only the active history. The initial **General study** chat uses all current documents and preserves the previous single-chat history when migrating.
 
 The system prompt directs the model to use only retrieved context, respond in the question's language, cite filenames, and use a fixed refusal in Thai or English when evidence is missing. Retrieved excerpts are shown separately so the evidence can be inspected.
 
@@ -136,7 +146,7 @@ The system prompt directs the model to use only retrieved context, respond in th
 4. Stage, commit, add the GitHub remote, and push the chosen branch:
 
    ```powershell
-   git add app.py requirements.txt README.md .gitignore validate_project.py data test_questions.csv .streamlit/secrets.toml.example
+   git add app.py requirements.txt README.md .gitignore validate_project.py data test_questions.csv .streamlit/config.toml .streamlit/secrets.toml.example
    git commit -m "Build personal tutor RAG app"
    git branch -M main
    git remote add origin https://github.com/<YOUR_GITHUB_USERNAME>/personal-tutor-rag.git
@@ -147,11 +157,13 @@ The system prompt directs the model to use only retrieved context, respond in th
 
 ## Upload Documents in the Web App
 
-1. Open **Add learning documents (.txt)** in the sidebar.
-2. Select one or more UTF-8 `.txt` files and click **Add documents**. The app validates the extension and text encoding, stores files in `data/documents/`, and reports added, duplicate, or invalid files.
+1. Open the **Library** tab, then expand **Add or update documents** and choose **Upload files**.
+2. Select one or more UTF-8 `.txt` or text-based `.pdf` files and click **Add documents**. The app validates the file type and content, stores files in `data/documents/`, and reports added, duplicate, or invalid files.
 3. After a successful upload, the app reruns. The FAISS cache key hashes the filenames and contents, so the changed corpus is reloaded, re-chunked, embedded, and indexed for subsequent questions.
 
-Existing files are never overwritten. A different document with the same filename gets a numeric suffix; an identical same-name file is skipped. Uploaded file content is treated as reference text, not instructions. Upload only material you have permission to use and do not upload secrets or personal data.
+Existing files are never overwritten. A different document with the same filename gets a numeric suffix; an identical same-name file is skipped. PDF text is extracted page by page, and citations can include the source PDF page. Scanned/image-only PDFs and password-protected PDFs are rejected; run OCR first and upload a searchable PDF. Uploaded file content is treated as reference text, not instructions. Upload only material you have permission to use and do not upload secrets or personal data.
+
+The **Library** tab lists each filename, topic, and character count. Select **Open a document** to preview extracted PDF text or TXT content, or download the original file. Under **Add or update documents**, choose **Write new notes** to create a text document or **Append notes** to add text to an existing TXT file. Saving any document reruns the app and rebuilds the cached FAISS index from the updated files.
 
 On Streamlit Community Cloud, uploaded files live on the app's local filesystem, which is ephemeral and may be cleared when the app restarts or redeploys. For durable shared documents, add reviewed files to `data/documents/` in the repository and redeploy, or connect persistent external storage.
 
@@ -175,7 +187,7 @@ The source documents are committed with the app. Chat history and FAISS vectors 
 
 ## Limitations
 
-- Only UTF-8 `.txt` files are supported; PDFs and other formats are not loaded.
+- The app supports UTF-8 `.txt` and text-based `.pdf`; scanned PDFs require OCR before upload, and password-protected PDFs are not supported.
 - Retrieval quality depends on document coverage and semantic similarity. A language model can still make mistakes, so verify important answers against the displayed source excerpts.
 - FAISS L2 distance is useful for ranking but is not a calibrated confidence score. The prompt-based refusal is not a formal guarantee; evaluate the three unknown questions before relying on the app.
 - The first model download and index build use CPU and may be slow or memory-intensive on a small instance.

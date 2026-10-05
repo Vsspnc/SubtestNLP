@@ -1,6 +1,7 @@
 # Secrets and local configuration
 .streamlit/*
 !.streamlit/
+!.streamlit/config.toml
 !.streamlit/secrets.toml.example
 .streamlit/secrets.toml
 .env

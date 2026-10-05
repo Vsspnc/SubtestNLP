@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 
 import streamlit as st
-from langchain_community.document_loaders import DirectoryLoader, TextLoader
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pypdf import PdfReader
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -45,35 +48,50 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_document_manifest() -> tuple[tuple[str, str], ...]:
-    """Hash source documents so a changed corpus creates a fresh FAISS index."""
+    """Hash TXT and PDF sources so changes create a fresh FAISS index."""
     return tuple(
         (path.name, hashlib.sha256(path.read_bytes()).hexdigest())
-        for path in sorted(DATA_DIR.glob("*.txt"))
-        if path.is_file()
+        for path in sorted(DATA_DIR.iterdir())
+        if path.is_file() and path.suffix.lower() in {".txt", ".pdf"}
     )
 
 
 def save_uploaded_document(filename: str, content: bytes) -> tuple[str, bool]:
-    """Save a UTF-8 text upload without overwriting an existing document."""
+    """Validate and save a UTF-8 TXT or text-based PDF without overwriting."""
     safe_name = Path(filename.replace("\\", "/")).name
-    if not safe_name or Path(safe_name).suffix.lower() != ".txt":
-        raise ValueError("Only .txt documents are supported.")
+    extension = Path(safe_name).suffix.lower()
+    if not safe_name or extension not in {".txt", ".pdf"}:
+        raise ValueError("Only .txt and .pdf documents are supported.")
 
-    text = clean_text(content.decode("utf-8-sig"))
-    if not text:
-        raise ValueError("The file is empty.")
+    if extension == ".txt":
+        text = clean_text(content.decode("utf-8-sig"))
+        if not text:
+            raise ValueError("The file is empty.")
+        stored_content = (text + "\n").encode("utf-8")
+    else:
+        try:
+            reader = PdfReader(io.BytesIO(content))
+            if reader.is_encrypted and not reader.decrypt(""):
+                raise ValueError("Password-protected PDFs are not supported.")
+            extracted_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        except ValueError:
+            raise
+        except Exception as error:
+            raise ValueError(f"Unable to read this PDF: {error}") from error
+        if not clean_text(extracted_text):
+            raise ValueError("This PDF contains no selectable text. Scanned PDFs need OCR before upload.")
+        stored_content = content
 
-    original = Path(f"{Path(safe_name).stem}.txt")
+    original = Path(f"{Path(safe_name).stem}{extension}")
     destination = DATA_DIR / original.name
     suffix = 1
-    normalized_text = text + "\n"
     while destination.exists():
-        if destination.read_text(encoding="utf-8") == normalized_text:
+        if destination.read_bytes() == stored_content:
             return destination.name, False
         destination = DATA_DIR / f"{original.stem}_{suffix}{original.suffix}"
         suffix += 1
 
-    destination.write_text(normalized_text, encoding="utf-8")
+    destination.write_bytes(stored_content)
     return destination.name, True
 
 
@@ -85,26 +103,107 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def load_source_document(path: Path) -> list[Document]:
+    """Load TXT as one document and PDFs as page-level documents."""
+    if path.suffix.lower() == ".pdf":
+        return PyPDFLoader(str(path)).load()
+    return TextLoader(str(path), encoding="utf-8").load()
+
+
+def read_document_text(path: Path) -> str:
+    """Extract readable text for a TXT or PDF document preview."""
+    documents = load_source_document(path)
+    if path.suffix.lower() == ".pdf":
+        return "\n\n".join(
+            f"Page {document.metadata.get('page', index) + 1}\n{document.page_content}"
+            for index, document in enumerate(documents)
+        )
+    return documents[0].page_content if documents else ""
+
+
+def create_text_document(title: str, content: str) -> tuple[str, bool]:
+    """Create a new text document from a title and editor content."""
+    normalized_title = title.strip().replace("\\", "/")
+    stem = re.sub(r"[^\w.-]+", "_", Path(normalized_title).stem, flags=re.UNICODE).strip("._-")
+    if not stem:
+        raise ValueError("Enter a document title containing letters or numbers.")
+    if not content.strip():
+        raise ValueError("Document content cannot be empty.")
+    return save_uploaded_document(f"{stem}.txt", content.encode("utf-8"))
+
+
+def append_document_text(filename: str, content: str) -> str:
+    """Append text to an existing corpus document and return its filename."""
+    safe_name = Path(filename.replace("\\", "/")).name
+    target = DATA_DIR / safe_name
+    if safe_name != filename or target.suffix.lower() != ".txt" or not target.is_file():
+        raise ValueError("Select an existing .txt document from the library.")
+
+    addition = clean_text(content)
+    if not addition:
+        raise ValueError("Content to append cannot be empty.")
+
+    existing = clean_text(target.read_text(encoding="utf-8"))
+    target.write_text(f"{existing}\n\n{addition}\n", encoding="utf-8")
+    return target.name
+
+
+def select_chat_manifest(
+    manifest: tuple[tuple[str, str], ...],
+    selected_sources: tuple[str, ...],
+) -> tuple[tuple[str, str], ...]:
+    """Keep only the manifest entries selected for one chat."""
+    selected = set(selected_sources)
+    return tuple(entry for entry in manifest if entry[0] in selected)
+
+
+def make_example_questions() -> list[str]:
+    """Create three concise starter prompts for a new or empty chat."""
+    return [
+        "อธิบายหัวข้อนี้",
+        "สรุปก่อนสอบ",
+        "ทบทวนด้วย 3 ข้อ",
+    ]
+
+
+def initialize_chat_state(document_names: list[str]) -> dict[str, dict[str, Any]]:
+    """Initialize chat storage and migrate the previous single-chat history."""
+    chats = st.session_state.setdefault("chats", {})
+    if not chats and document_names:
+        chat_id = uuid.uuid4().hex
+        selected_sources = tuple(document_names)
+        title = "General study"
+        chats[chat_id] = {
+            "title": title,
+            "documents": list(selected_sources),
+            "examples": make_example_questions(),
+            "messages": st.session_state.pop("messages", []),
+        }
+        st.session_state["active_chat_id"] = chat_id
+    return chats
+
+
 def list_subjects() -> list[str]:
     """Return only immediate subdirectories of the knowledge-base root."""
     return sorted(path.name for path in DATA_DIR.iterdir() if path.is_dir())
 
 
 @st.cache_resource(max_entries=2, show_spinner="Loading documents and building the FAISS index...")
-def load_vectorstore(manifest: tuple[tuple[str, str], ...]) -> FAISS | None:
-    """Load the corpus, add source metadata, chunk it, embed it, and build FAISS."""
+def load_vectorstore(
+    manifest: tuple[tuple[str, str], ...],
+    selected_sources: tuple[str, ...] | None = None,
+) -> FAISS | None:
+    """Build a cached FAISS index from only the source files selected for this chat."""
     if not manifest:
         return None
 
-    loader = DirectoryLoader(
-        str(DATA_DIR),
-        glob="*.txt",
-        loader_cls=TextLoader,
-        loader_kwargs={"encoding": "utf-8"},
-        show_progress=False,
-        use_multithreading=False,
-    )
-    documents: list[Document] = loader.load()
+    source_names = set(selected_sources or (filename for filename, _ in manifest))
+    documents = [
+        document
+        for path in sorted(DATA_DIR.iterdir())
+        if path.is_file() and path.name in source_names
+        for document in load_source_document(path)
+    ]
     documents = [document for document in documents if document.page_content.strip()]
     for document in documents:
         filename = Path(str(document.metadata.get("source", "unknown.txt"))).name
@@ -119,6 +218,8 @@ def load_vectorstore(manifest: tuple[tuple[str, str], ...]) -> FAISS | None:
                 "topic": topic,
             }
         )
+        if isinstance(document.metadata.get("page"), int):
+            document.metadata["page_number"] = document.metadata["page"] + 1
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
@@ -175,8 +276,9 @@ def retrieve_documents(
 def format_context(retrieved: list[dict[str, Any]]) -> str:
     """Format retrieved chunks with traceable document and chunk identifiers."""
     return "\n\n".join(
-        "[Source: {source} | Topic: {topic} | Chunk: {chunk_id}]\n{content}".format(
+        "[Source: {source}{page} | Topic: {topic} | Chunk: {chunk_id}]\n{content}".format(
             source=item["source"],
+            page=(f", Page {item['metadata']['page_number']}" if "page_number" in item["metadata"] else ""),
             topic=item["metadata"].get("topic", "Unknown topic"),
             chunk_id=item["metadata"].get("chunk_id", "?"),
             content=item["content"],
@@ -233,14 +335,20 @@ def render_assistant_message(message: dict[str, Any]) -> None:
     if not retrieved:
         return
 
-    sources = list(dict.fromkeys(item["source"] for item in retrieved))
-    st.markdown("**📚 Sources / Retrieved Documents**: " + ", ".join(f"`{source}`" for source in sources))
+    citations = []
+    for item in retrieved:
+        page_number = item["metadata"].get("page_number")
+        citation = item["source"] if page_number is None else f"{item['source']} (p. {page_number})"
+        if citation not in citations:
+            citations.append(citation)
+    st.markdown("**📚 Sources / Retrieved Documents**: " + ", ".join(f"`{source}`" for source in citations))
     with st.expander("View Retrieved Context"):
         st.caption("FAISS L2 distance; a lower value indicates a closer vector match.")
         for index, item in enumerate(retrieved):
             metadata = item["metadata"]
             st.markdown(
                 f"**{item['source']}** | {metadata.get('topic', 'Unknown topic')} "
+                f"{('| page ' + str(metadata['page_number'])) if 'page_number' in metadata else ''} "
                 f"| chunk {metadata.get('chunk_id', '?')} | distance {item['distance']:.4f}"
             )
             st.write(item["content"])
@@ -249,19 +357,19 @@ def render_assistant_message(message: dict[str, Any]) -> None:
 
 
 def render_document_uploader() -> None:
-    """Accept TXT course notes and refresh the FAISS index after successful saves."""
-    with st.sidebar.form("document_upload_form", clear_on_submit=True):
+    """Accept TXT and PDF course notes and refresh FAISS after successful saves."""
+    with st.form("document_upload_form", clear_on_submit=True):
         uploaded_files = st.file_uploader(
-            "Add learning documents (.txt)",
-            type=["txt"],
+            "Add learning documents (.txt, .pdf)",
+            type=["txt", "pdf"],
             accept_multiple_files=True,
-            help="UTF-8 text files are saved to data/documents/ and added to retrieval.",
+            help="Upload UTF-8 TXT or text-based PDFs. Scanned PDFs require OCR first.",
         )
         submitted = st.form_submit_button("Add documents", use_container_width=True)
 
     if submitted:
         if not uploaded_files:
-            st.sidebar.error("Select at least one .txt file.")
+            st.error("Select at least one .txt or .pdf file.")
             return
 
         added: list[str] = []
@@ -285,85 +393,331 @@ def render_document_uploader() -> None:
             }
             st.rerun()
         if skipped:
-            st.sidebar.info("Already present: " + ", ".join(skipped))
+            st.info("Already present: " + ", ".join(skipped))
         for error in errors:
-            st.sidebar.error(error)
+            st.error(error)
+
+
+def render_document_library() -> None:
+    """Manage, preview, and download the learning corpus."""
+    st.subheader("Learning library")
+    st.caption("Browse source material and manage what the tutor can retrieve.")
+    upload_feedback = st.session_state.pop("upload_feedback", None)
+    if upload_feedback:
+        if upload_feedback["added"]:
+            st.success("Added: " + ", ".join(upload_feedback["added"]))
+        if upload_feedback["skipped"]:
+            st.info("Already present: " + ", ".join(upload_feedback["skipped"]))
+        for error in upload_feedback["errors"]:
+            st.error(error)
+
+    documents = sorted(
+        path
+        for path in DATA_DIR.iterdir()
+        if path.is_file() and path.suffix.lower() in {".txt", ".pdf"}
+    )
+
+    with st.expander("Add or update documents", expanded=False):
+        upload_tab, create_tab, append_tab = st.tabs(["Upload files", "Write new notes", "Append notes"])
+        with upload_tab:
+            render_document_uploader()
+        with create_tab:
+            with st.form("create_document_form", clear_on_submit=True):
+                title = st.text_input("Document title", placeholder="e.g. DNS Basics")
+                new_content = st.text_area("Document content", height=180)
+                create_submitted = st.form_submit_button("Create document", use_container_width=True)
+            if create_submitted:
+                try:
+                    filename, created = create_text_document(title, new_content)
+                    if created:
+                        st.session_state["document_feedback"] = f"Created {filename}. The search index will refresh."
+                        st.rerun()
+                    st.info(f"{filename} already contains the same text.")
+                except (OSError, UnicodeDecodeError, ValueError) as error:
+                    st.error(str(error))
+        with append_tab:
+            text_documents = [path for path in documents if path.suffix.lower() == ".txt"]
+            if text_documents:
+                with st.form("append_document_form", clear_on_submit=True):
+                    append_target = st.selectbox(
+                        "Choose a text document",
+                        options=[path.name for path in text_documents],
+                        key="append_document_target",
+                    )
+                    appended_content = st.text_area("Content to append", height=180)
+                    append_submitted = st.form_submit_button("Append content", use_container_width=True)
+                if append_submitted:
+                    try:
+                        filename = append_document_text(append_target, appended_content)
+                        st.session_state["document_feedback"] = f"Updated {filename}. The search index will refresh."
+                        st.rerun()
+                    except (OSError, UnicodeDecodeError, ValueError) as error:
+                        st.error(str(error))
+            else:
+                st.info("Upload or create a .txt document before appending text.")
+
+    st.markdown("#### Documents")
+    st.caption(f"{len(documents)} documents in the learning library")
+    if documents:
+        document_rows = []
+        for path in documents:
+            content = read_document_text(path)
+            topic = TOPICS.get(path.stem, path.stem.replace("_", " ").title())
+            document_rows.append(
+                {
+                    "Document": path.name,
+                    "Topic": topic,
+                    "Characters": len(content),
+                }
+            )
+        st.dataframe(document_rows, use_container_width=True, hide_index=True)
+
+        selected_name = st.selectbox("Open a document", options=[path.name for path in documents], key="document_preview_selection")
+        selected_path = DATA_DIR / selected_name
+        selected_content = read_document_text(selected_path)
+        is_pdf = selected_path.suffix.lower() == ".pdf"
+        download_data = selected_path.read_bytes() if is_pdf else selected_content
+        download_mime = "application/pdf" if is_pdf else "text/plain"
+        _, download_column = st.columns([4, 1])
+        with download_column:
+            st.download_button("Download source", data=download_data, file_name=selected_name, mime=download_mime, key="download_selected_document", use_container_width=True)
+        st.text_area(
+            "Document preview",
+            value=selected_content,
+            height=280,
+            disabled=True,
+            key=f"preview_{selected_name}",
+        )
+    else:
+        st.info("No documents yet. Add a text file, PDF, or create notes above.")
+
+
+def inject_app_styles() -> None:
+    """Apply a calm study-workspace theme without changing Streamlit behavior."""
+    st.markdown(
+    """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Noto+Sans+Thai:wght@400;500;600;700&display=swap');
+:root {
+    --ink: #20352e;
+    --muted: #63766e;
+    --line: #dbe5e0;
+    --paper: #ffffff;
+    --wash: #f4f7f5;
+    --mint: #e9f0ed;
+    --green: #277563;
+    --gold: #b77b20;
+}
+html, body, [class*="css"] {
+    font-family: "DM Sans", "Noto Sans Thai", sans-serif;
+    letter-spacing: 0;
+}
+.stApp { background: var(--wash); color: var(--ink); }
+[data-testid="stSidebar"] {
+    background: var(--mint);
+    border-right: 1px solid var(--line);
+}
+.block-container { max-width: 1380px; padding-top: 2rem; padding-bottom: 5rem; }
+h1, h2, h3 { color: var(--ink); letter-spacing: 0; }
+h1 { font-size: 2.1rem !important; font-weight: 700 !important; }
+.sidebar-brand { display: flex; align-items: center; gap: .7rem; margin: .3rem 0 1rem; }
+.sidebar-brand-mark {
+    display: grid; place-items: center; width: 2.35rem; height: 2.35rem;
+    border-radius: 9px; background: var(--green); color: white; font-weight: 700;
+}
+.sidebar-brand-title { color: var(--ink); font-size: 1rem; font-weight: 700; }
+.sidebar-brand-subtitle { color: var(--muted); font-size: .75rem; }
+[data-testid="stMetric"] {
+    background: var(--paper); border: 1px solid var(--line); border-radius: 9px; padding: .65rem .8rem;
+}
+[data-testid="stTabs"] button[role="tab"] { font-weight: 600; }
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+    color: var(--green); border-bottom-color: var(--green);
+}
+[data-testid="stChatMessage"] {
+    background: var(--paper); border: 1px solid var(--line); border-radius: 10px;
+    padding: .9rem 1rem; margin-bottom: .75rem;
+}
+[data-testid="stChatInput"] textarea { border-radius: 10px; }
+div[data-testid="stButton"] > button,
+div[data-testid="stFormSubmitButton"] > button,
+div[data-testid="stDownloadButton"] > button {
+    min-height: 2.55rem; border-radius: 8px; font-weight: 600;
+    border-color: #cbd9d2; transition: border-color .15s ease, background .15s ease;
+}
+div[data-testid="stButton"] > button:hover,
+div[data-testid="stDownloadButton"] > button:hover { border-color: var(--green); color: var(--green); }
+[data-testid="stExpander"] { border: 1px solid var(--line); border-radius: 9px; background: var(--paper); }
+[data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+[data-testid="stTextInput"] input, [data-testid="stTextArea"] textarea,
+[data-testid="stMultiSelect"] [data-baseweb="select"] > div { border-radius: 8px; }
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def main() -> None:
-    st.title("🎓 Personal Tutor – AI Learning Assistant")
-    st.caption("ผู้ช่วยติวส่วนตัวที่ตอบคำถามจากเอกสารการเรียนของคุณ")
+    inject_app_styles()
+    st.title("🎓 Personal Tutor")
+    st.caption("ผู้ช่วยติวส่วนตัวที่ตอบจากเอกสารที่คุณเลือก")
 
     manifest = get_document_manifest()
-    vectorstore = load_vectorstore(manifest)
-    chunk_count = len(vectorstore.index_to_docstore_id) if vectorstore else 0
+    document_names = [filename for filename, _ in manifest]
+    chats = initialize_chat_state(document_names)
+    active_chat_id: str | None = None
+    active_chat: dict[str, Any] | None = None
 
     with st.sidebar:
-        st.header("About System")
-        st.write("A source-grounded tutor for computer networks and cybersecurity.")
-        st.metric("Documents", len(manifest))
-        st.metric("Chunks", chunk_count)
-        st.caption(f"Embedding: `{EMBEDDING_MODEL}`")
-        st.caption(f"LLM: `{CHAT_MODEL}`")
-        top_k = st.slider("Top-K retrieval", min_value=3, max_value=5, value=TOP_K)
-        render_document_uploader()
-        upload_feedback = st.session_state.pop("upload_feedback", None)
-        if upload_feedback:
-            if upload_feedback["added"]:
-                st.success("Added: " + ", ".join(upload_feedback["added"]))
-            if upload_feedback["skipped"]:
-                st.info("Already present: " + ", ".join(upload_feedback["skipped"]))
-            for error in upload_feedback["errors"]:
-                st.error(error)
-        if st.button("Clear Chat", use_container_width=True):
-            st.session_state["messages"] = []
-            st.rerun()
+        st.markdown(
+            '<div class="sidebar-brand"><span class="sidebar-brand-mark">PT</span>'
+            '<div><div class="sidebar-brand-title">Study desk</div>'
+            '<div class="sidebar-brand-subtitle">Personal learning workspace</div></div></div>',
+            unsafe_allow_html=True,
+        )
+        document_stat, chat_stat = st.columns(2)
+        document_stat.metric("Docs", len(manifest))
+        chat_stat.metric("Chats", len(chats))
+        top_k = st.slider("Sources per answer", min_value=3, max_value=5, value=TOP_K)
 
-    if not manifest or vectorstore is None:
-        st.error("No readable .txt documents found in `data/documents/`.")
-        st.info("Add UTF-8 learning notes to the documents folder, then rerun the app.")
-        return
+        if document_names:
+            with st.expander("＋ New chat", expanded=False):
+                with st.form("new_chat_form", clear_on_submit=True):
+                    new_chat_title = st.text_input("Chat name", placeholder="e.g. OSI exam review")
+                    selected_documents = st.multiselect(
+                        "Use these documents",
+                        options=document_names,
+                        default=document_names,
+                    )
+                    create_chat = st.form_submit_button("Create chat", use_container_width=True)
+                if create_chat:
+                    if not selected_documents:
+                        st.error("Select at least one document for this chat.")
+                    else:
+                        chat_id = uuid.uuid4().hex
+                        title = new_chat_title.strip() or f"Study chat {len(chats) + 1}"
+                        selected_sources = tuple(selected_documents)
+                        chats[chat_id] = {
+                            "title": title,
+                            "documents": list(selected_sources),
+                            "examples": make_example_questions(),
+                            "messages": [],
+                        }
+                        st.session_state["active_chat_id"] = chat_id
+                        st.rerun()
 
-    messages = st.session_state.setdefault("messages", [])
-    for message in messages:
-        with st.chat_message(message["role"]):
-            if message["role"] == "assistant":
-                render_assistant_message(message)
-            else:
-                st.markdown(message["content"])
+        if chats:
+            st.markdown("#### Your chats")
+            chat_ids = list(chats)
+            previous_chat_id = st.session_state.get("active_chat_id")
+            selected_index = chat_ids.index(previous_chat_id) if previous_chat_id in chat_ids else 0
+            active_chat_id = st.selectbox(
+                "Open a chat",
+                options=chat_ids,
+                index=selected_index,
+                format_func=lambda chat_id: chats[chat_id]["title"],
+            )
+            st.session_state["active_chat_id"] = active_chat_id
+            active_chat = chats[active_chat_id]
+            st.caption(f"{len(active_chat['documents'])} source documents")
+            with st.expander("View chat sources", expanded=False):
+                for filename in active_chat["documents"]:
+                    st.markdown(f"- `{filename}`")
+            if st.button("Clear chat history", use_container_width=True):
+                active_chat["messages"] = []
+                st.rerun()
+        else:
+            st.info("Add a document in the Library to start a chat.")
 
-    question = st.chat_input("Ask a question about your learning documents")
-    if not question:
-        return
+        with st.expander("System details", expanded=False):
+            st.caption(f"Embedding model: `{EMBEDDING_MODEL}`")
+            st.caption(f"Language model: `{CHAT_MODEL}`")
 
-    messages.append({"role": "user", "content": question})
-    with st.chat_message("user"):
-        st.markdown(question)
+    selected_sources = tuple(active_chat["documents"]) if active_chat else ()
+    selected_manifest = select_chat_manifest(manifest, selected_sources)
+    vectorstore = load_vectorstore(selected_manifest, selected_sources) if selected_manifest else None
+    chunk_count = len(vectorstore.index_to_docstore_id) if vectorstore else 0
+    with st.sidebar:
+        st.metric("Indexed chunks in this chat", chunk_count)
 
-    api_key = get_groq_api_key()
-    if not api_key:
-        st.error("GROQ_API_KEY is not configured. Add it to `.streamlit/secrets.toml` or Streamlit Cloud Secrets.")
-        return
+    document_feedback = st.session_state.pop("document_feedback", None)
+    if document_feedback:
+        st.success(document_feedback)
 
-    with st.chat_message("assistant"):
-        with st.spinner("Retrieving learning notes and preparing your explanation..."):
-            try:
-                answer, retrieved = answer_question(
-                    question,
-                    messages[:-1],
-                    vectorstore,
-                    api_key,
-                    top_k=top_k,
-                )
-                assistant_message = {
-                    "role": "assistant",
-                    "content": answer,
-                    "retrieved": retrieved,
-                }
-                render_assistant_message(assistant_message)
-                messages.append(assistant_message)
-            except Exception as error:
-                st.error(f"The tutor could not complete this request: {error}")
+    chat_tab, documents_tab = st.tabs(["💬 Tutor", "📚 Library"])
+    with documents_tab:
+        render_document_library()
+
+    with chat_tab:
+        if not document_names:
+            st.info("Upload or create documents to start a chat.")
+            return
+        if active_chat is None or active_chat_id is None:
+            st.info("Create a chat in the sidebar and choose which documents it can use.")
+            return
+        if vectorstore is None:
+            st.warning("The selected chat has no readable documents. Create a new chat and select available files.")
+            return
+
+        st.subheader(active_chat["title"])
+        st.caption(f"This chat searches only its {len(active_chat['documents'])} selected source documents.")
+        messages = active_chat["messages"]
+        for message in messages:
+            with st.chat_message(message["role"]):
+                if message["role"] == "assistant":
+                    render_assistant_message(message)
+                else:
+                    st.markdown(message["content"])
+
+        if not messages:
+            st.markdown("#### Start with an example")
+            st.caption("Choose a prompt below, or write your own question.")
+            examples = make_example_questions()
+            example_columns = st.columns(3)
+            for index, (column, example) in enumerate(zip(example_columns, examples)):
+                with column:
+                    if st.button(example, key=f"example_{active_chat_id}_{index}", use_container_width=True):
+                        st.session_state["pending_chat_question"] = {
+                            "chat_id": active_chat_id,
+                            "question": example,
+                        }
+                        st.rerun()
+
+        question = st.chat_input("Ask only about the documents selected for this chat")
+        pending_question = st.session_state.pop("pending_chat_question", None)
+        if pending_question and pending_question["chat_id"] == active_chat_id:
+            question = pending_question["question"]
+        if not question:
+            return
+
+        messages.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        api_key = get_groq_api_key()
+        if not api_key:
+            st.error("GROQ_API_KEY is not configured. Add it to `.streamlit/secrets.toml` or Streamlit Cloud Secrets.")
+            return
+
+        with st.chat_message("assistant"):
+            with st.spinner("Retrieving learning notes and preparing your explanation..."):
+                try:
+                    answer, retrieved = answer_question(
+                        question,
+                        messages[:-1],
+                        vectorstore,
+                        api_key,
+                        top_k=top_k,
+                    )
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": answer,
+                        "retrieved": retrieved,
+                    }
+                    render_assistant_message(assistant_message)
+                    messages.append(assistant_message)
+                except Exception as error:
+                    st.error(f"The tutor could not complete this request: {error}")
 
 
 if __name__ == "__main__":
